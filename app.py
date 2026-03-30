@@ -127,17 +127,27 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ─── Download NLTK ───────────────────────────────────────────
+# ─── Download NLTK data ──────────────────────────────────────
 @st.cache_resource
 def download_nltk():
-    nltk.download('punkt',     quiet=True)
-    nltk.download('stopwords', quiet=True)
-    nltk.download('punkt_tab', quiet=True)
+    import ssl
+    try:
+        _ctx = ssl._create_unverified_context
+    except AttributeError:
+        pass
+    else:
+        ssl._create_default_https_context = ssl._create_unverified_context
+
+    for pkg in ['punkt', 'stopwords', 'punkt_tab']:
+        try:
+            nltk.download(pkg, quiet=True)
+        except Exception:
+            pass
 
 download_nltk()
 
 # ─── Dataset ─────────────────────────────────────────────────
-IMDB_CSV = "IMDB Dataset.csv"   # place this file in the same folder as app.py
+IMDB_CSV = "IMDB-Dataset.csv"   # place this file in the same folder as app.py
 
 FALLBACK_DATA = {
     'review': [
@@ -238,12 +248,12 @@ def load_data():
                 st.warning("CSV found but columns are wrong. Expected 'review' and 'sentiment'.")
                 raise ValueError("Bad columns")
 
-            # Sample substantially more data for robust accuracy
+            # Sample 1000 positive + 1000 negative
             df_pos = df_raw[df_raw['sentiment'] == 'positive'].sample(
-                n=min(5000, (df_raw['sentiment'] == 'positive').sum()), random_state=42
+                n=min(1000, (df_raw['sentiment'] == 'positive').sum()), random_state=42
             ).copy()
             df_neg = df_raw[df_raw['sentiment'] == 'negative'].sample(
-                n=min(5000, (df_raw['sentiment'] == 'negative').sum()), random_state=42
+                n=min(1000, (df_raw['sentiment'] == 'negative').sum()), random_state=42
             ).copy()
 
             # Create Neutral: reviews containing hedging language
@@ -253,7 +263,7 @@ def load_data():
             pattern    = '|'.join(neutral_kw)
             df_neutral = df_raw[
                 df_raw['review'].str.lower().str.contains(pattern, na=False)
-            ].sample(n=min(2000, df_raw.shape[0]), random_state=42).copy()
+            ].sample(n=min(500, df_raw.shape[0]), random_state=42).copy()
 
             df_pos['label']     = 'Positive'
             df_neg['label']     = 'Negative'
@@ -266,22 +276,20 @@ def load_data():
                 ignore_index=True
             ).sample(frac=1, random_state=42).reset_index(drop=True)
 
-            # Return data source info instead of storing it in session state
-            data_source = f"IMDb CSV  ({len(df):,} reviews)"
-            return df, data_source
+            # Store source info in session state for display
+            st.session_state['data_source'] = f"IMDb CSV  ({len(df):,} reviews)"
+            return df
 
         except Exception as e:
             st.warning(f"Could not load IMDb CSV: {e} — using built-in dataset.")
 
     # Fallback
-    data_source = "Built-in sample dataset (75 reviews)"
-    return pd.DataFrame(FALLBACK_DATA), data_source
+    st.session_state['data_source'] = "Built-in sample dataset (75 reviews)"
+    return pd.DataFrame(FALLBACK_DATA)
 
 # ─── Preprocessing ───────────────────────────────────────────
 stemmer    = PorterStemmer()
-# Keep negation words to improve accuracy (e.g. 'not good' vs 'good')
-negation_words = {'not', 'no', 'nor', 'neither', 'never', 'none', 'but', 'isnt', 'wasnt', 'werent', 'havent', 'hasnt', 'hadnt', 'wont', 'shouldnt', 'couldnt', 'mustnt', 'didnt', 'doesnt', 'arent'}
-stop_words     = set(stopwords.words('english')) - negation_words
+stop_words = set(stopwords.words('english'))
 
 def preprocess_text(text):
     text   = re.sub(r'<.*?>', '', str(text))
@@ -294,24 +302,24 @@ def preprocess_text(text):
 
 # ─── Train Model ─────────────────────────────────────────────
 @st.cache_resource
-def build_classification_model():
-    df, data_source = load_data()
+def train_model():
+    df = load_data()
     df['cleaned'] = df['review'].apply(preprocess_text)
-    vectorizer    = TfidfVectorizer(max_features=10000, ngram_range=(1, 2))
+    vectorizer    = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
     X             = vectorizer.fit_transform(df['cleaned'])
     y             = df['label']
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
-    model = MultinomialNB(alpha=0.1)
+    model = MultinomialNB(alpha=0.5)
     model.fit(X_train, y_train)
     y_pred   = model.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
     report   = classification_report(y_test, y_pred, output_dict=True)
     cm       = confusion_matrix(y_test, y_pred, labels=['Positive','Negative','Neutral'])
-    return model, vectorizer, accuracy, report, cm, df, data_source
+    return model, vectorizer, accuracy, report, cm, df
 
-model, vectorizer, accuracy, report, cm, df, data_source = build_classification_model()
+model, vectorizer, accuracy, report, cm, df = train_model()
 
 # ─── Sidebar ─────────────────────────────────────────────────
 with st.sidebar:
@@ -353,14 +361,15 @@ if page == "🏠 Home & Predict":
 
     # Top metrics
     # Dataset source banner
+    data_source = st.session_state.get('data_source', 'Built-in sample dataset (75 reviews)')
     is_imdb     = "IMDb" in data_source
     banner_col  = "#00C9A7" if is_imdb else "#F7B731"
     banner_icon = "✅" if is_imdb else "⚠️"
     banner_msg  = (
         f"{banner_icon} Using real-world <strong>IMDb dataset</strong> — {data_source}"
         if is_imdb else
-        f"{banner_icon} <strong>IMDB Dataset.csv not found</strong> — using built-in 75-review dataset. "
-        f"Place <code>IMDB Dataset.csv</code> in the same folder and restart the app."
+        f"{banner_icon} <strong>IMDB-Dataset.csv not found</strong> — using built-in 75-review dataset. "
+        f"Place <code>IMDB-Dataset.csv</code> in the same folder and restart the app."
     )
     st.markdown(
         f'<div style="background:#1A2E45;border:1px solid {banner_col};border-radius:8px;'
@@ -403,13 +412,8 @@ if page == "🏠 Home & Predict":
 
     with col_left:
         st.markdown('<div class="section-header">✍️ Enter Movie Review</div>', unsafe_allow_html=True)
-        # Initialize focus text if not present
-        if 'example_text' not in st.session_state:
-            st.session_state['example_text'] = ""
-
         user_input = st.text_area(
             "Type or paste a movie review below:",
-            value=st.session_state['example_text'],
             placeholder="e.g. This movie was absolutely fantastic! I loved every moment of it...",
             height=160,
             label_visibility="collapsed"
@@ -427,7 +431,10 @@ if page == "🏠 Home & Predict":
             with ex_cols[i]:
                 if st.button(label, key=f"ex_{i}"):
                     st.session_state['example_text'] = ex
-                    st.rerun()
+
+        # Use example if clicked
+        if 'example_text' in st.session_state:
+            user_input = st.session_state['example_text']
 
         predict_btn = st.button("🔍 Classify Review")
 
@@ -445,7 +452,7 @@ if page == "🏠 Home & Predict":
         """)
 
     # Prediction result
-    if user_input.strip():
+    if predict_btn and user_input.strip():
         cleaned    = preprocess_text(user_input)
         vectorized = vectorizer.transform([cleaned])
         prediction = model.predict(vectorized)[0]
